@@ -1222,7 +1222,8 @@ current_state = {
     "decision": decision,
     "signal": signal,
     "regime": regime,
-    "day_type": day_type
+    "day_type": day_type,
+    "gate_status": tuple(gate_df["Status"].tolist())
 }
 
 previous_state = st.session_state.previous_state
