@@ -758,7 +758,8 @@ fig.add_trace(go.Scatter(
     name="CALL Signal",
     marker=dict(
         symbol="triangle-up",
-        size=14
+        size=14,
+        color="lime"
     ),
     text=[
         f"CALL<br>Quality: {q}<br>Score: {s}<br>Regime: {r}"
@@ -779,7 +780,8 @@ fig.add_trace(go.Scatter(
     name="PUT Signal",
     marker=dict(
         symbol="triangle-down",
-        size=14
+        size=14,
+        color="red"
     ),
     text=[
         f"PUT<br>Quality: {q}<br>Score: {s}<br>Regime: {r}"
