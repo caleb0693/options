@@ -1,1280 +1,906 @@
+# ============================================================
+# Live 0DTE SPX App V2
+# Signal Quality + Regime + Execution Gate Architecture
+# ============================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, time
-from zoneinfo import ZoneInfo
-
-try:
-    from streamlit_autorefresh import st_autorefresh
-except Exception:
-    st_autorefresh = None
-
+from datetime import datetime, time, date
+import plotly.graph_objects as go
+import plotly.express as px
+from pathlib import Path
 
 # ============================================================
-# AUTOMATIC EVENT LOGGER UPGRADE
-# Add this to the app
-# ============================================================
-
-import os
-
-LOG_FILE = "spx_event_log.csv"
-
-
-def log_event(
-    timestamp,
-    price,
-    regime,
-    score,
-    day_type,
-    breadth,
-    breadth_count,
-    rvol,
-    signal,
-    decision,
-    decision_reason,
-    gate_df
-):
-    gate_summary = " | ".join([
-        f"{row['Gate']}: {row['Status']}"
-        for _, row in gate_df.iterrows()
-    ])
-
-    event_row = pd.DataFrame([{
-        "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-        "price": round(price, 2),
-        "regime": regime,
-        "regime_score": score,
-        "day_type": day_type,
-        "breadth": round(breadth, 2),
-        "breadth_persistence": breadth_count,
-        "rvol": round(rvol, 2) if pd.notna(rvol) else np.nan,
-        "signal": signal,
-        "decision": decision,
-        "decision_reason": decision_reason,
-        "gate_status": gate_summary
-    }])
-
-    file_exists = os.path.exists(LOG_FILE)
-
-    event_row.to_csv(
-        LOG_FILE,
-        mode="a",
-        header=not file_exists,
-        index=False
-    )
-
-
-
-# ============================================================
-# App Configuration
+# Streamlit Config
 # ============================================================
 
 st.set_page_config(
-    page_title="SPX 0DTE Gated Decision Dashboard",
-    page_icon="📈",
+    page_title="Live 0DTE SPX App V2",
     layout="wide"
 )
 
-EASTERN = ZoneInfo("America/New_York")
+st.title("Live 0DTE SPX App V2")
+st.caption("Signal-quality, regime-aware, gated decision-support tool for 0DTE SPX-style trading.")
 
-ETF_SYMBOLS = [
-    "SPY", "QQQ", "IWM",
-    "XLK", "XLF", "XLV", "XLY", "XLI",
-    "XLE", "XLP", "XLU", "XLB", "XLRE", "XLC"
-]
+st.warning(
+    "This app uses SPY or QQQ intraday market data as a live proxy. "
+    "It does not model real option premiums, theta, gamma, IV, slippage, or bid/ask spread."
+)
 
 
 # ============================================================
-# Market Data Functions
+# Manual Refresh Controls
 # ============================================================
 
-@st.cache_data(ttl=30)
-def get_intraday_data(symbol: str, period: str = "1d", interval: str = "1m") -> pd.DataFrame:
-    try:
-        df = yf.download(
-            symbol,
-            period=period,
-            interval=interval,
-            progress=False,
-            auto_adjust=False,
-            prepost=False
-        )
-    except Exception:
-        return pd.DataFrame()
+refresh_col1, refresh_col2, refresh_col3 = st.columns([1, 2, 6])
 
-    if df.empty:
-        return pd.DataFrame()
+with refresh_col1:
+    if st.button("🔄 Refresh"):
+        st.rerun()
 
+with refresh_col2:
+    st.metric(
+        "Last Refresh",
+        datetime.now().strftime("%H:%M:%S")
+    )
+
+with refresh_col3:
+    st.caption(
+        "Manual refresh enabled. "
+        "Click refresh to reload live market data and recalculate signals."
+    )
+
+
+
+# ============================================================
+# File Paths
+# ============================================================
+
+LOG_FILE = Path("0dte_live_v2_log.csv")
+TRADE_FILE = Path("0dte_live_v2_trades.csv")
+
+
+# ============================================================
+# Utility Functions
+# ============================================================
+
+def flatten_columns(df):
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-
-    df = df.reset_index()
-
-    if "Datetime" in df.columns:
-        df = df.rename(columns={"Datetime": "datetime"})
-    elif "Date" in df.columns:
-        df = df.rename(columns={"Date": "datetime"})
-
-    df["datetime"] = pd.to_datetime(df["datetime"])
-
-    if df["datetime"].dt.tz is None:
-        df["datetime"] = df["datetime"].dt.tz_localize("UTC").dt.tz_convert(EASTERN)
-    else:
-        df["datetime"] = df["datetime"].dt.tz_convert(EASTERN)
-
+        df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
     return df
 
 
-@st.cache_data(ttl=300)
-def get_daily_data(symbol: str, period: str = "30d") -> pd.DataFrame:
-    try:
-        df = yf.download(
-            symbol,
-            period=period,
-            interval="1d",
-            progress=False,
-            auto_adjust=False
-        )
-    except Exception:
-        return pd.DataFrame()
+
+def load_live_data(symbol="SPY", period="5d", interval="5m"):
+    df = yf.download(
+        symbol,
+        period=period,
+        interval=interval,
+        auto_adjust=True,
+        progress=False
+    )
+
+    df = flatten_columns(df)
 
     if df.empty:
         return pd.DataFrame()
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-
-    return df.reset_index()
-
-
-@st.cache_data(ttl=300)
-def get_multiday_intraday_data(symbol: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
-    try:
-        df = yf.download(
-            symbol,
-            period=period,
-            interval=interval,
-            progress=False,
-            auto_adjust=False,
-            prepost=False
-        )
-    except Exception:
-        return pd.DataFrame()
-
-    if df.empty:
-        return pd.DataFrame()
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
 
     df = df.reset_index()
 
-    if "Datetime" in df.columns:
-        df = df.rename(columns={"Datetime": "datetime"})
-    elif "Date" in df.columns:
-        df = df.rename(columns={"Date": "datetime"})
+    datetime_col = "Datetime" if "Datetime" in df.columns else "Date"
+    df = df.rename(columns={datetime_col: "datetime"})
 
     df["datetime"] = pd.to_datetime(df["datetime"])
 
+    # Convert timezone safely to US/Eastern
     if df["datetime"].dt.tz is None:
-        df["datetime"] = df["datetime"].dt.tz_localize("UTC").dt.tz_convert(EASTERN)
+        df["datetime"] = df["datetime"].dt.tz_localize("UTC").dt.tz_convert("America/New_York")
     else:
-        df["datetime"] = df["datetime"].dt.tz_convert(EASTERN)
+        df["datetime"] = df["datetime"].dt.tz_convert("America/New_York")
+
+    df["datetime"] = df["datetime"].dt.tz_localize(None)
+
+    df["date"] = df["datetime"].dt.date
+    df["time"] = df["datetime"].dt.time
+
+    # Regular market hours in Eastern time
+    df = df[
+        (df["time"] >= time(9, 30)) &
+        (df["time"] <= time(16, 0))
+    ].copy()
 
     return df
 
-
-def calculate_vwap(df: pd.DataFrame) -> float:
-    if df.empty or "Volume" not in df.columns or df["Volume"].sum() == 0:
-        return np.nan
+def calculate_vwap(df):
+    df = df.copy()
 
     typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
-    return float((typical_price * df["Volume"]).sum() / df["Volume"].sum())
+    df["pv"] = typical_price * df["Volume"]
+
+    df["cum_pv"] = df.groupby("date")["pv"].cumsum()
+    df["cum_vol"] = df.groupby("date")["Volume"].cumsum()
+
+    df["vwap"] = df["cum_pv"] / df["cum_vol"]
+
+    return df
 
 
-def calculate_ema(df: pd.DataFrame, span: int) -> float:
-    if df.empty or "Close" not in df.columns:
-        return np.nan
+def calculate_opening_range(df, opening_minutes=30):
+    df = df.copy()
+    df["or_high"] = np.nan
+    df["or_low"] = np.nan
 
-    return float(df["Close"].ewm(span=span, adjust=False).mean().iloc[-1])
+    for d, group in df.groupby("date"):
+        day_start = group["datetime"].min()
+        or_end = day_start + pd.Timedelta(minutes=opening_minutes)
 
+        or_window = group[group["datetime"] < or_end]
 
-def calculate_ema_slope(df: pd.DataFrame, span: int = 20, lookback: int = 5) -> float:
-    if df.empty or len(df) < span + lookback:
-        return np.nan
-
-    ema = df["Close"].ewm(span=span, adjust=False).mean()
-    return float(ema.iloc[-1] - ema.iloc[-lookback])
-
-
-def calculate_atr(df: pd.DataFrame, window: int = 14) -> float:
-    if df.empty or len(df) < window + 1:
-        return np.nan
-
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
-    prev_close = close.shift(1)
-
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs()
-        ],
-        axis=1
-    ).max(axis=1)
-
-    return float(tr.rolling(window).mean().iloc[-1])
-
-
-def get_previous_day_levels(symbol: str):
-    daily = get_daily_data(symbol)
-
-    if daily.empty or len(daily) < 2:
-        return np.nan, np.nan, np.nan
-
-    prev = daily.iloc[-2]
-    return float(prev["High"]), float(prev["Low"]), float(prev["Close"])
-
-
-def get_opening_range(df: pd.DataFrame):
-    if df.empty:
-        return np.nan, np.nan
-
-    temp = df.copy()
-    temp["t"] = temp["datetime"].dt.time
-
-    opening = temp[
-        (temp["t"] >= time(9, 30)) &
-        (temp["t"] < time(9, 45))
-    ]
-
-    if opening.empty:
-        return np.nan, np.nan
-
-    return float(opening["High"].max()), float(opening["Low"].min())
-
-
-def market_time_now():
-    return datetime.now(EASTERN)
-
-
-# ============================================================
-# Filters and Classifiers
-# ============================================================
-
-def calculate_rvol(today_5m_df: pd.DataFrame, history_5m_df: pd.DataFrame):
-    if today_5m_df.empty or history_5m_df.empty or "Volume" not in today_5m_df.columns:
-        return np.nan, "RVOL unavailable"
-
-    now_t = today_5m_df["datetime"].iloc[-1].time()
-    today_date = today_5m_df["datetime"].dt.date.iloc[-1]
-    current_cum_vol = today_5m_df["Volume"].sum()
-
-    hist = history_5m_df.copy()
-    hist["date"] = hist["datetime"].dt.date
-    hist["t"] = hist["datetime"].dt.time
-
-    prior = hist[hist["date"] != today_date]
-    prior_same_time = prior[prior["t"] <= now_t]
-
-    if prior_same_time.empty:
-        return np.nan, "RVOL unavailable"
-
-    daily_cum = prior_same_time.groupby("date")["Volume"].sum()
-
-    if daily_cum.empty or daily_cum.mean() == 0:
-        return np.nan, "RVOL unavailable"
-
-    rvol = float(current_cum_vol / daily_cum.mean())
-
-    if rvol >= 1.5:
-        label = "High relative volume"
-    elif rvol >= 1.0:
-        label = "Normal/elevated volume"
-    elif rvol >= 0.8:
-        label = "Slightly weak volume"
-    else:
-        label = "Weak relative volume"
-
-    return rvol, label
-
-
-def classify_gap(open_price, prev_close, prev_high, prev_low):
-    if any(pd.isna(x) for x in [open_price, prev_close, prev_high, prev_low]):
-        return "Gap unavailable", np.nan
-
-    gap_pct = ((open_price - prev_close) / prev_close) * 100
-
-    if open_price > prev_high:
-        gap_type = "Gap Up Above Prior High"
-    elif open_price < prev_low:
-        gap_type = "Gap Down Below Prior Low"
-    elif abs(gap_pct) < 0.15:
-        gap_type = "Flat / Small Gap"
-    elif open_price > prev_close:
-        gap_type = "Inside-Range Gap Up"
-    else:
-        gap_type = "Inside-Range Gap Down"
-
-    return gap_type, float(gap_pct)
-
-
-def classify_day_type(price, vwap, opening_high, opening_low, atr_5m, breadth, rvol, ema_slope):
-    if any(pd.isna(x) for x in [price, vwap, opening_high, opening_low, atr_5m, breadth]):
-        return "Unknown", ["Missing day-type inputs"]
-
-    reasons = []
-
-    vwap_distance = abs(price - vwap)
-    strong_breadth = abs(breadth) >= 0.60
-    high_rvol = pd.notna(rvol) and rvol >= 1.2
-    strong_ema_slope = pd.notna(ema_slope) and abs(ema_slope) >= atr_5m * 0.25
-    outside_opening_range = price > opening_high or price < opening_low
-    extended_from_vwap = vwap_distance >= atr_5m
-
-    reasons.append("Price outside opening range" if outside_opening_range else "Price inside opening range")
-    reasons.append("Strong breadth" if strong_breadth else "Breadth not strong")
-    reasons.append("RVOL supportive" if high_rvol else "RVOL not elevated")
-    reasons.append("EMA slope supportive" if strong_ema_slope else "EMA slope not strong")
-
-    if outside_opening_range and strong_breadth and (high_rvol or strong_ema_slope):
-        return "Trend / Momentum Day", reasons
-
-    if outside_opening_range and extended_from_vwap and not strong_breadth:
-        return "Breakout Risk / Possible Fade", reasons
-
-    if not outside_opening_range and not strong_breadth and not high_rvol:
-        return "Chop / Range Day", reasons
-
-    if outside_opening_range and high_rvol:
-        return "Expansion Day", reasons
-
-    return "Neutral / Developing", reasons
-
-
-def update_breadth_persistence(current_breadth, threshold=0.60):
-    if "breadth_persistence" not in st.session_state:
-        st.session_state["breadth_persistence"] = {
-            "direction": "Neutral",
-            "count": 0,
-            "history": []
-        }
-
-    if current_breadth >= threshold:
-        direction = "Bullish"
-    elif current_breadth <= -threshold:
-        direction = "Bearish"
-    else:
-        direction = "Neutral"
-
-    state = st.session_state["breadth_persistence"]
-
-    if direction == state["direction"] and direction != "Neutral":
-        state["count"] += 1
-    elif direction != "Neutral":
-        state["direction"] = direction
-        state["count"] = 1
-    else:
-        state["direction"] = "Neutral"
-        state["count"] = 0
-
-    state["history"].append({
-        "timestamp": datetime.now(EASTERN).strftime("%H:%M:%S"),
-        "breadth": current_breadth,
-        "direction": direction,
-        "count": state["count"]
-    })
-
-    state["history"] = state["history"][-50:]
-    st.session_state["breadth_persistence"] = state
-
-    return state["direction"], state["count"], pd.DataFrame(state["history"])
-
-
-@st.cache_data(ttl=30)
-def calculate_auto_etf_breadth():
-    rows = []
-    positive = 0
-    negative = 0
-
-    for symbol in ETF_SYMBOLS:
-        df = get_intraday_data(symbol)
-
-        if df.empty:
+        if or_window.empty:
             continue
 
-        last_price = float(df["Close"].iloc[-1])
-        vwap = calculate_vwap(df)
+        df.loc[df["date"] == d, "or_high"] = or_window["High"].max()
+        df.loc[df["date"] == d, "or_low"] = or_window["Low"].min()
 
-        if pd.isna(vwap):
-            continue
-
-        above_vwap = last_price > vwap
-
-        if above_vwap:
-            positive += 1
-        else:
-            negative += 1
-
-        pct_from_vwap = ((last_price - vwap) / vwap) * 100
-
-        rows.append({
-            "Symbol": symbol,
-            "Last": round(last_price, 2),
-            "VWAP": round(vwap, 2),
-            "Above VWAP": above_vwap,
-            "% From VWAP": round(pct_from_vwap, 2)
-        })
-
-    total = positive + negative
-    breadth = 0.0 if total == 0 else (positive - negative) / total
-
-    return breadth, positive, negative, pd.DataFrame(rows)
+    return df
 
 
-def calculate_manual_breadth_score(advancers, decliners):
-    total = advancers + decliners
+def calculate_indicators(df):
+    df = df.copy()
 
-    if total == 0:
-        return 0.0
+    df = calculate_vwap(df)
+    df = calculate_opening_range(df)
 
-    return (advancers - decliners) / total
-
-
-def normalize_tick(tick_value):
-    return max(min(tick_value / 1000, 1), -1)
-
-
-def normalize_vold(vold_value):
-    return max(min(vold_value / 1_000_000_000, 1), -1)
-
-
-def composite_manual_breadth(advancers, decliners, tick_value, vold_value):
-    adv_decl_score = calculate_manual_breadth_score(advancers, decliners)
-    tick_score = normalize_tick(tick_value)
-    vold_score = normalize_vold(vold_value)
-
-    composite = (
-        0.50 * adv_decl_score +
-        0.30 * tick_score +
-        0.20 * vold_score
+    df["ema_9"] = df.groupby("date")["Close"].transform(
+        lambda x: x.ewm(span=9, adjust=False).mean()
     )
 
-    return composite, adv_decl_score, tick_score, vold_score
+    df["ema_21"] = df.groupby("date")["Close"].transform(
+        lambda x: x.ewm(span=21, adjust=False).mean()
+    )
+
+    df["bar_return"] = df.groupby("date")["Close"].pct_change()
+
+    df["volume_ma"] = df.groupby("date")["Volume"].transform(
+        lambda x: x.rolling(20, min_periods=5).mean()
+    )
+
+    df["rvol"] = df["Volume"] / df["volume_ma"]
+
+    df["above_vwap"] = df["Close"] > df["vwap"]
+    df["below_vwap"] = df["Close"] < df["vwap"]
+
+    df["above_or"] = df["Close"] > df["or_high"]
+    df["below_or"] = df["Close"] < df["or_low"]
+
+    df["trend_up"] = (df["ema_9"] > df["ema_21"]) & (df["Close"] > df["vwap"])
+    df["trend_down"] = (df["ema_9"] < df["ema_21"]) & (df["Close"] < df["vwap"])
+
+    return df
 
 
-# ============================================================
-# Regime, Signal, Risk, and Gated Decision Flow
-# ============================================================
+def classify_regime(row):
+    if row["trend_up"] and row["above_or"]:
+        return "TREND_UP"
 
-def classify_regime(price, vwap, ema9, ema20, prev_high, prev_low, vix, breadth):
-    score = 0
-    reasons = []
+    if row["trend_down"] and row["below_or"]:
+        return "TREND_DOWN"
 
-    if pd.notna(vwap):
-        if price > vwap:
-            score += 1
-            reasons.append("Price above VWAP")
-        else:
-            score -= 1
-            reasons.append("Price below VWAP")
+    if row["Close"] > row["vwap"] and row["ema_9"] > row["ema_21"]:
+        return "BULLISH"
+
+    if row["Close"] < row["vwap"] and row["ema_9"] < row["ema_21"]:
+        return "BEARISH"
+
+    return "CHOP"
+
+
+def score_signal(row):
+    call_score = 0
+    put_score = 0
+
+    call_reasons = []
+    put_reasons = []
+
+    # CALL score
+    if row["Close"] > row["vwap"]:
+        call_score += 1
+        call_reasons.append("Price above VWAP")
+
+    if row["ema_9"] > row["ema_21"]:
+        call_score += 1
+        call_reasons.append("EMA9 above EMA21")
+
+    if row["Close"] > row["or_high"]:
+        call_score += 2
+        call_reasons.append("Break above opening range")
+
+    if row["rvol"] >= 1.2:
+        call_score += 1
+        call_reasons.append("Elevated RVOL")
+
+    if row["bar_return"] > 0:
+        call_score += 1
+        call_reasons.append("Positive bar momentum")
+
+    # PUT score
+    if row["Close"] < row["vwap"]:
+        put_score += 1
+        put_reasons.append("Price below VWAP")
+
+    if row["ema_9"] < row["ema_21"]:
+        put_score += 1
+        put_reasons.append("EMA9 below EMA21")
+
+    if row["Close"] < row["or_low"]:
+        put_score += 2
+        put_reasons.append("Break below opening range")
+
+    if row["rvol"] >= 1.2:
+        put_score += 1
+        put_reasons.append("Elevated RVOL")
+
+    if row["bar_return"] < 0:
+        put_score += 1
+        put_reasons.append("Negative bar momentum")
+
+    if call_score > put_score and call_score >= 4:
+        direction = "CALL"
+        score = call_score
+        reasons = call_reasons
+
+    elif put_score > call_score and put_score >= 4:
+        direction = "PUT"
+        score = put_score
+        reasons = put_reasons
+
     else:
-        reasons.append("VWAP unavailable")
+        direction = "NONE"
+        score = max(call_score, put_score)
+        reasons = ["No dominant directional setup"]
 
-    if pd.notna(ema9) and pd.notna(ema20):
-        if ema9 > ema20:
-            score += 1
-            reasons.append("9 EMA above 20 EMA")
-        else:
-            score -= 1
-            reasons.append("9 EMA below 20 EMA")
+    if score >= 6:
+        quality = "A+"
+    elif score == 5:
+        quality = "A"
+    elif score == 4:
+        quality = "B"
+    elif score == 3:
+        quality = "C"
     else:
-        reasons.append("EMA data unavailable")
+        quality = "D"
 
-    if pd.notna(prev_high) and pd.notna(prev_low):
-        if price > prev_high:
-            score += 1
-            reasons.append("Price above previous day high")
-        elif price < prev_low:
-            score -= 1
-            reasons.append("Price below previous day low")
-        else:
-            reasons.append("Price inside prior day range")
+    return direction, score, quality, reasons, call_score, put_score
+
+
+def quality_passes(quality, min_quality):
+    rank = {"D": 0, "C": 1, "B": 2, "A": 3, "A+": 4}
+    return rank[quality] >= rank[min_quality]
+
+
+def load_trade_state():
+    if TRADE_FILE.exists():
+        trades = pd.read_csv(TRADE_FILE)
     else:
-        reasons.append("Previous day levels unavailable")
+        trades = pd.DataFrame(columns=[
+            "timestamp",
+            "date",
+            "direction",
+            "signal_quality",
+            "regime",
+            "entry_price",
+            "planned_stop",
+            "planned_target",
+            "status",
+            "outcome_r"
+        ])
 
-    if breadth > 0.60:
-        score += 1
-        reasons.append("Strong bullish breadth")
-    elif breadth < -0.60:
-        score -= 1
-        reasons.append("Strong bearish breadth")
+    return trades
+
+
+def save_trade_record(record):
+    trades = load_trade_state()
+    trades = pd.concat([trades, pd.DataFrame([record])], ignore_index=True)
+    trades.to_csv(TRADE_FILE, index=False)
+
+
+def log_event(record):
+    if LOG_FILE.exists():
+        log_df = pd.read_csv(LOG_FILE)
     else:
-        reasons.append("Neutral / mixed breadth")
+        log_df = pd.DataFrame()
 
-    if pd.notna(vix):
-        if vix > 25:
-            reasons.append("High VIX: larger moves and higher option premiums")
-        elif vix < 13:
-            reasons.append("Low VIX: option premium may decay quickly")
-        else:
-            reasons.append("Moderate VIX")
-    else:
-        reasons.append("VIX unavailable")
-
-    if score >= 3:
-        regime = "Bullish trend / call-favored"
-    elif score <= -3:
-        regime = "Bearish trend / put-favored"
-    else:
-        regime = "Mixed / no-trade or wait"
-
-    return regime, score, reasons
+    log_df = pd.concat([log_df, pd.DataFrame([record])], ignore_index=True)
+    log_df.to_csv(LOG_FILE, index=False)
 
 
-def trade_signal(regime, price, opening_high, opening_low, vwap, atr_5m, current_time):
-    signal = "No Trade"
-    setup = "Wait for confirmation"
-    invalidation = "No valid setup"
-
-    in_morning_window = time(9, 35) <= current_time <= time(10, 30)
-    in_afternoon_window = time(13, 30) <= current_time <= time(15, 0)
-
-    if not (in_morning_window or in_afternoon_window):
-        return signal, setup, "Outside preferred trading window"
-
-    if any(pd.isna(x) for x in [opening_high, opening_low, vwap, atr_5m]):
-        return signal, setup, "Missing required market inputs"
-
-    if "call-favored" in regime and price > opening_high and price > vwap:
-        signal = "CALL Watch"
-        setup = "Opening range / trend continuation breakout"
-        invalidation = max(vwap, opening_high - atr_5m)
-
-    elif "put-favored" in regime and price < opening_low and price < vwap:
-        signal = "PUT Watch"
-        setup = "Opening range / trend continuation breakdown"
-        invalidation = min(vwap, opening_low + atr_5m)
-
-    return signal, setup, invalidation
-
-
-def risk_box(account_size, risk_pct, option_price, stop_loss_pct):
-    risk_dollars = account_size * risk_pct / 100
-    risk_per_contract = option_price * 100 * stop_loss_pct / 100
-
-    if risk_per_contract <= 0:
-        contracts = 0
-    else:
-        contracts = int(risk_dollars // risk_per_contract)
-
-    max_premium = contracts * option_price * 100
-
-    return risk_dollars, risk_per_contract, contracts, max_premium
-
-
-def gated_trade_decision(
-    signal,
-    score,
-    price,
-    vwap,
-    opening_high,
-    opening_low,
-    breadth,
-    breadth_count,
-    rvol,
-    day_type,
-    contracts,
-    current_time,
-    invalidation
+def evaluate_execution_gate(
+    row,
+    direction,
+    quality,
+    min_quality,
+    regime,
+    trades_today,
+    max_trades_per_day,
+    max_consecutive_losses,
+    cooldown_minutes,
+    allow_chop,
+    start_trade_time,
+    end_trade_time
 ):
-    flow_rows = []
+    reasons = []
 
-    def add_gate(gate, status, detail):
-        flow_rows.append({
-            "Gate": gate,
-            "Status": status,
-            "Detail": detail
-        })
+    now_time = row["time"]
 
-    # 1. Environment Gate
-    tradable_window = (
-        time(9, 35) <= current_time <= time(10, 30)
-        or time(13, 30) <= current_time <= time(15, 0)
-    )
+    if now_time < start_trade_time:
+        reasons.append("Before allowed trading window")
 
-    if not tradable_window:
-        add_gate("1. Environment", "FAIL", "Outside preferred trading window.")
-        return "STAY OUT", "Environment gate failed: outside preferred trading window.", pd.DataFrame(flow_rows)
+    if now_time > end_trade_time:
+        reasons.append("After allowed trading window")
 
-    if day_type in ["Chop / Range Day", "Breakout Risk / Possible Fade"]:
-        add_gate("1. Environment", "FAIL", f"Day type is {day_type}.")
-        return "STAY OUT", f"Environment gate failed: {day_type}.", pd.DataFrame(flow_rows)
+    if direction == "NONE":
+        reasons.append("No directional signal")
 
-    if pd.notna(rvol) and rvol < 0.80:
-        add_gate("1. Environment", "FAIL", f"RVOL is weak at {rvol:.2f}.")
-        return "STAY OUT", "Environment gate failed: weak relative volume.", pd.DataFrame(flow_rows)
+    if not quality_passes(quality, min_quality):
+        reasons.append(f"Signal quality below minimum threshold: {quality}")
 
-    add_gate("1. Environment", "PASS", f"Day type is {day_type}; RVOL acceptable.")
+    if regime == "CHOP" and not allow_chop:
+        reasons.append("CHOP regime blocked")
 
-    # 2. Direction Gate
-    if signal == "CALL Watch":
-        if score < 3:
-            add_gate("2. Direction", "FAIL", f"CALL requires regime score >= +3. Current score: {score}.")
-            return "STAY OUT", "Direction gate failed: bullish regime not strong enough.", pd.DataFrame(flow_rows)
+    if len(trades_today) >= max_trades_per_day:
+        reasons.append("Max trades per day reached")
 
-        if breadth <= 0:
-            add_gate("2. Direction", "FAIL", f"CALL requires positive breadth. Current breadth: {breadth:.2f}.")
-            return "STAY OUT", "Direction gate failed: breadth does not support CALL.", pd.DataFrame(flow_rows)
+    if not trades_today.empty:
+        completed = trades_today.dropna(subset=["outcome_r"]).copy()
 
-        if price <= vwap:
-            add_gate("2. Direction", "FAIL", "CALL requires price above VWAP.")
-            return "STAY OUT", "Direction gate failed: price not above VWAP.", pd.DataFrame(flow_rows)
+        if not completed.empty:
+            completed["outcome_r"] = pd.to_numeric(completed["outcome_r"], errors="coerce")
 
-        add_gate("2. Direction", "PASS", "Bullish regime, positive breadth, price above VWAP.")
+            last_losses = completed.tail(max_consecutive_losses)
 
-    elif signal == "PUT Watch":
-        if score > -3:
-            add_gate("2. Direction", "FAIL", f"PUT requires regime score <= -3. Current score: {score}.")
-            return "STAY OUT", "Direction gate failed: bearish regime not strong enough.", pd.DataFrame(flow_rows)
+            if len(last_losses) >= max_consecutive_losses and (last_losses["outcome_r"] < 0).all():
+                reasons.append("Consecutive loss lockout active")
 
-        if breadth >= 0:
-            add_gate("2. Direction", "FAIL", f"PUT requires negative breadth. Current breadth: {breadth:.2f}.")
-            return "STAY OUT", "Direction gate failed: breadth does not support PUT.", pd.DataFrame(flow_rows)
+        last_trade_time = pd.to_datetime(trades_today["timestamp"]).max()
+        current_time = pd.to_datetime(row["datetime"])
 
-        if price >= vwap:
-            add_gate("2. Direction", "FAIL", "PUT requires price below VWAP.")
-            return "STAY OUT", "Direction gate failed: price not below VWAP.", pd.DataFrame(flow_rows)
+        minutes_since_last_trade = (current_time - last_trade_time).total_seconds() / 60
 
-        add_gate("2. Direction", "PASS", "Bearish regime, negative breadth, price below VWAP.")
+        if minutes_since_last_trade < cooldown_minutes:
+            reasons.append(f"Cooldown active: {minutes_since_last_trade:.0f} min since last trade")
+
+    trade_allowed = len(reasons) == 0
+
+    if trade_allowed:
+        reasons.append("All execution gates passed")
+
+    return trade_allowed, reasons
+
+
+def calculate_trade_plan(row, direction, stop_points, target_points):
+    entry = row["Close"]
+
+    if direction == "CALL":
+        stop = entry - stop_points
+        target = entry + target_points
+
+    elif direction == "PUT":
+        stop = entry + stop_points
+        target = entry - target_points
 
     else:
-        add_gate("2. Direction", "FAIL", "No CALL Watch or PUT Watch signal.")
-        return "STAY OUT", "Direction gate failed: no actionable directional signal.", pd.DataFrame(flow_rows)
+        stop = np.nan
+        target = np.nan
 
-    # 3. Structure Gate
-    if signal == "CALL Watch":
-        if price <= opening_high:
-            add_gate("3. Structure", "FAIL", "CALL requires price above opening range high.")
-            return "STAY OUT", "Structure gate failed: no confirmed opening range breakout.", pd.DataFrame(flow_rows)
+    return entry, stop, target
 
-        add_gate("3. Structure", "PASS", "Price is above opening range high.")
 
-    elif signal == "PUT Watch":
-        if price >= opening_low:
-            add_gate("3. Structure", "FAIL", "PUT requires price below opening range low.")
-            return "STAY OUT", "Structure gate failed: no confirmed opening range breakdown.", pd.DataFrame(flow_rows)
-
-        add_gate("3. Structure", "PASS", "Price is below opening range low.")
-
-    # 4. Persistence Gate
-    if signal == "CALL Watch":
-        if 0 < breadth < 0.60:
-            add_gate("4. Persistence", "CAUTION", f"Breadth positive but not strong: {breadth:.2f}.")
-            return "WATCH ONLY", "Watch only: CALL setup exists, but breadth is not strong.", pd.DataFrame(flow_rows)
-
-        if breadth >= 0.60 and breadth_count < 1:
-            add_gate("4. Persistence", "WAIT", "Strong bullish breadth has not persisted yet.")
-            return "WATCH ONLY", "Wait for bullish breadth persistence.", pd.DataFrame(flow_rows)
-
-        add_gate("4. Persistence", "PASS", "Bullish breadth is strong and persistent enough.")
-
-    elif signal == "PUT Watch":
-        if -0.60 < breadth < 0:
-            add_gate("4. Persistence", "CAUTION", f"Breadth negative but not strong: {breadth:.2f}.")
-            return "WATCH ONLY", "Watch only: PUT setup exists, but breadth is not strong.", pd.DataFrame(flow_rows)
-
-        if breadth <= -0.60 and breadth_count < 1:
-            add_gate("4. Persistence", "WAIT", "Strong bearish breadth has not persisted yet.")
-            return "WATCH ONLY", "Wait for bearish breadth persistence.", pd.DataFrame(flow_rows)
-
-        add_gate("4. Persistence", "PASS", "Bearish breadth is strong and persistent enough.")
-
-    # 5. Risk Gate
-    if contracts <= 0:
-        add_gate("5. Risk", "FAIL", "Position size returned zero contracts.")
-        return "STAY OUT", "Risk gate failed: position size is not valid.", pd.DataFrame(flow_rows)
-
-    if not isinstance(invalidation, (int, float, np.floating)):
-        add_gate("5. Risk", "FAIL", "No defined invalidation level.")
-        return "STAY OUT", "Risk gate failed: no defined invalidation level.", pd.DataFrame(flow_rows)
-
-    add_gate("5. Risk", "PASS", f"Contracts: {contracts}; invalidation defined.")
-
-    # 6. Final Decision
-    if signal == "CALL Watch":
-        add_gate("6. Final Decision", "PASS", "All gates passed for BUY CALL.")
-        return "BUY CALL", "All gates passed: bullish environment, direction, structure, persistence, and risk.", pd.DataFrame(flow_rows)
-
-    if signal == "PUT Watch":
-        add_gate("6. Final Decision", "PASS", "All gates passed for BUY PUT.")
-        return "BUY PUT", "All gates passed: bearish environment, direction, structure, persistence, and risk.", pd.DataFrame(flow_rows)
-
-    add_gate("6. Final Decision", "FAIL", "No actionable setup.")
-    return "STAY OUT", "No actionable setup after gated evaluation.", pd.DataFrame(flow_rows)
-
+def format_reasons(reasons):
+    return "; ".join(reasons)
 
 
 # ============================================================
-# Sidebar
+# Sidebar Settings
 # ============================================================
 
-st.sidebar.title("SPX 0DTE Controls")
+with st.sidebar:
+    st.header("Market Data")
 
-st.sidebar.subheader("Refresh Controls")
-
-auto_refresh_enabled = st.sidebar.toggle("Enable Auto Refresh", value=True)
-
-refresh_seconds = st.sidebar.selectbox(
-    "Refresh interval (seconds)",
-    [15, 30, 60, 120, 300],
-    index=1
-)
-
-manual_refresh = st.sidebar.button("Refresh Now")
-
-if manual_refresh:
-    st.cache_data.clear()
-    st.rerun()
-
-if auto_refresh_enabled and st_autorefresh is not None:
-    st_autorefresh(interval=refresh_seconds * 1000, key="market_refresh")
-
-st.sidebar.divider()
-
-account_size = st.sidebar.number_input(
-    "Account Size ($)",
-    min_value=500.0,
-    value=10000.0,
-    step=500.0
-)
-
-risk_pct = st.sidebar.slider(
-    "Risk per Trade (%)",
-    0.25,
-    5.0,
-    1.0,
-    0.25
-)
-
-max_daily_loss_pct = st.sidebar.slider(
-    "Max Daily Loss (%)",
-    1.0,
-    10.0,
-    3.0,
-    0.5
-)
-
-st.sidebar.divider()
-
-st.sidebar.subheader("Breadth Mode")
-
-breadth_mode = st.sidebar.radio(
-    "Select breadth source",
-    [
-        "Auto ETF Breadth Proxy",
-        "Manual Composite Internals",
-        "Simple Manual Score"
-    ],
-    index=0
-)
-
-if breadth_mode == "Auto ETF Breadth Proxy":
-    breadth, positive, negative, breadth_df = calculate_auto_etf_breadth()
-    breadth_source = "Auto ETF Breadth Proxy"
-
-    st.sidebar.metric("Breadth Score", f"{breadth:.2f}")
-    st.sidebar.metric("ETFs Above VWAP", positive)
-    st.sidebar.metric("ETFs Below VWAP", negative)
-
-elif breadth_mode == "Manual Composite Internals":
-    st.sidebar.caption("Use values from TradingView, broker charts, or a market internals dashboard.")
-
-    advancers = st.sidebar.number_input("Advancers", min_value=0, value=320, step=1)
-    decliners = st.sidebar.number_input("Decliners", min_value=0, value=180, step=1)
-    tick_value = st.sidebar.number_input("TICK", value=0, step=50)
-    vold_value = st.sidebar.number_input("VOLD", value=0, step=50_000_000)
-
-    breadth, adv_decl_score, tick_score, vold_score = composite_manual_breadth(
-        advancers,
-        decliners,
-        tick_value,
-        vold_value
+    symbol = st.selectbox(
+        "Proxy Symbol",
+        ["SPY", "QQQ"],
+        index=0
     )
 
-    breadth_source = "Manual Composite Internals"
-    breadth_df = pd.DataFrame()
+    period = st.selectbox(
+        "Lookback Period",
+        ["1d", "5d"],
+        index=1
+    )
 
-    st.sidebar.metric("Breadth Score", f"{breadth:.2f}")
-    st.sidebar.metric("ADV/DECL Score", f"{adv_decl_score:.2f}")
-    st.sidebar.metric("TICK Score", f"{tick_score:.2f}")
-    st.sidebar.metric("VOLD Score", f"{vold_score:.2f}")
+    interval = st.selectbox(
+        "Candle Interval",
+        ["1m", "2m", "5m", "15m"],
+        index=2
+    )
 
+    st.header("Signal Settings")
+
+    min_quality = st.selectbox(
+        "Minimum Trade Quality",
+        ["A+", "A", "B", "C"],
+        index=2
+    )
+
+    allow_chop = st.checkbox(
+        "Allow CHOP Regime Trades",
+        value=False
+    )
+
+    st.header("Trading Window")
+
+    start_trade_time = st.time_input(
+        "Start Trading",
+        value=time(13, 30)
+    )
+
+    end_trade_time = st.time_input(
+        "End Trading",
+        value=time(15, 45)
+    )
+
+    st.header("Risk Controls")
+
+    stop_points = st.number_input(
+        "Stop Points",
+        min_value=0.05,
+        value=0.50,
+        step=0.05
+    )
+
+    target_points = st.number_input(
+        "Target Points",
+        min_value=0.05,
+        value=0.50,
+        step=0.05
+    )
+
+    max_trades_per_day = st.number_input(
+        "Max Trades Per Day",
+        min_value=1,
+        value=3,
+        step=1
+    )
+
+    max_consecutive_losses = st.number_input(
+        "Max Consecutive Losses",
+        min_value=1,
+        value=2,
+        step=1
+    )
+
+    cooldown_minutes = st.number_input(
+        "Cooldown Minutes",
+        min_value=0,
+        value=15,
+        step=5
+    )
+
+
+# ============================================================
+# Data Load
+# ============================================================
+
+df = load_live_data(symbol=symbol, period=period, interval=interval)
+
+if df.empty:
+    st.error("No market data loaded.")
+    st.stop()
+
+df = calculate_indicators(df)
+
+df["regime"] = df.apply(classify_regime, axis=1)
+
+signal_results = df.apply(score_signal, axis=1)
+df["signal_direction"] = [x[0] for x in signal_results]
+df["signal_score"] = [x[1] for x in signal_results]
+df["signal_quality"] = [x[2] for x in signal_results]
+df["signal_reasons"] = [format_reasons(x[3]) for x in signal_results]
+df["call_score"] = [x[4] for x in signal_results]
+df["put_score"] = [x[5] for x in signal_results]
+
+latest = df.iloc[-1]
+
+today = latest["date"]
+
+trades = load_trade_state()
+
+if not trades.empty and "date" in trades.columns:
+    trades_today = trades[trades["date"].astype(str) == str(today)].copy()
 else:
-    breadth = st.sidebar.slider("Manual Breadth Score", -1.0, 1.0, 0.0, 0.1)
-    breadth_source = "Simple Manual Score"
-    breadth_df = pd.DataFrame()
-    positive = negative = 0
+    trades_today = pd.DataFrame()
 
-if breadth >= 0.60:
-    st.sidebar.success("Strong bullish breadth")
-elif breadth <= -0.60:
-    st.sidebar.error("Strong bearish breadth")
-else:
-    st.sidebar.warning("Neutral / mixed breadth")
+direction = latest["signal_direction"]
+quality = latest["signal_quality"]
+regime = latest["regime"]
 
-st.sidebar.divider()
-
-st.sidebar.subheader("Option Contract")
-
-option_price = st.sidebar.number_input(
-    "Option Premium ($)",
-    min_value=0.05,
-    value=8.00,
-    step=0.05
-)
-
-stop_loss_pct = st.sidebar.slider(
-    "Stop Loss on Option (%)",
-    10,
-    60,
-    25,
-    5
-)
-
-target_pct = st.sidebar.slider(
-    "Profit Target on Option (%)",
-    10,
-    100,
-    30,
-    5
-)
-
-st.sidebar.divider()
-
-manual_market_override = st.sidebar.toggle("Manual market override", value=False)
-
-
-# ============================================================
-# Market Data Pull
-# ============================================================
-
-now_et = market_time_now()
-
-if not manual_market_override:
-    underlying_symbol = "SPY"
-    vix_symbol = "^VIX"
-
-    price_df = get_intraday_data(underlying_symbol)
-    price_5m_df = get_intraday_data(underlying_symbol, interval="5m")
-    history_5m_df = get_multiday_intraday_data(underlying_symbol, period="5d", interval="5m")
-    vix_df = get_intraday_data(vix_symbol)
-
-    if price_df.empty:
-        st.error("Could not load SPY data from yfinance. Try manual market override.")
-        st.stop()
-
-    price = float(price_df["Close"].iloc[-1])
-    open_price = float(price_df["Open"].iloc[0])
-    last_timestamp = price_df["datetime"].iloc[-1]
-
-    vix = float(vix_df["Close"].iloc[-1]) if not vix_df.empty else np.nan
-
-    prev_high, prev_low, prev_close = get_previous_day_levels(underlying_symbol)
-    opening_high, opening_low = get_opening_range(price_df)
-
-    vwap = calculate_vwap(price_df)
-    ema9 = calculate_ema(price_df, 9)
-    ema20 = calculate_ema(price_df, 20)
-    ema_slope = calculate_ema_slope(price_df, span=20, lookback=5)
-
-    atr_5m = calculate_atr(price_5m_df, 14)
-
-    rvol, rvol_label = calculate_rvol(price_5m_df, history_5m_df)
-    gap_type, gap_pct = classify_gap(open_price, prev_close, prev_high, prev_low)
-
-    current_time = now_et.time()
-
-else:
-    st.sidebar.subheader("Manual Market Inputs")
-
-    price = st.sidebar.number_input("Current Price / SPY Proxy", value=530.0, step=0.1)
-    open_price = st.sidebar.number_input("Open Price", value=530.0, step=0.1)
-    prev_high = st.sidebar.number_input("Previous Day High", value=532.0, step=0.1)
-    prev_low = st.sidebar.number_input("Previous Day Low", value=526.5, step=0.1)
-    prev_close = st.sidebar.number_input("Previous Day Close", value=529.0, step=0.1)
-    opening_high = st.sidebar.number_input("Opening Range High", value=531.0, step=0.1)
-    opening_low = st.sidebar.number_input("Opening Range Low", value=528.5, step=0.1)
-    vwap = st.sidebar.number_input("VWAP", value=529.8, step=0.1)
-    ema9 = st.sidebar.number_input("9 EMA", value=530.5, step=0.1)
-    ema20 = st.sidebar.number_input("20 EMA", value=529.5, step=0.1)
-    ema_slope = st.sidebar.number_input("EMA Slope Proxy", value=0.2, step=0.1)
-    atr_5m = st.sidebar.number_input("5-Min ATR", value=0.6, step=0.1)
-    vix = st.sidebar.number_input("VIX", value=16.0, step=0.5)
-    rvol = st.sidebar.number_input("RVOL", value=1.0, step=0.1)
-    rvol_label = "Manual RVOL"
-    current_time = st.sidebar.time_input("Market Time", value=time(9, 45))
-    last_timestamp = now_et
-    price_df = pd.DataFrame()
-    gap_type, gap_pct = classify_gap(open_price, prev_close, prev_high, prev_low)
-
-
-# ============================================================
-# Derived Classifiers
-# ============================================================
-
-breadth_direction, breadth_count, breadth_history_df = update_breadth_persistence(
-    current_breadth=breadth,
-    threshold=0.60
-)
-
-day_type, day_type_reasons = classify_day_type(
-    price=price,
-    vwap=vwap,
-    opening_high=opening_high,
-    opening_low=opening_low,
-    atr_5m=atr_5m,
-    breadth=breadth,
-    rvol=rvol,
-    ema_slope=ema_slope
-)
-
-regime, score, reasons = classify_regime(
-    price=price,
-    vwap=vwap,
-    ema9=ema9,
-    ema20=ema20,
-    prev_high=prev_high,
-    prev_low=prev_low,
-    vix=vix,
-    breadth=breadth
-)
-
-signal, setup, invalidation = trade_signal(
+trade_allowed, gate_reasons = evaluate_execution_gate(
+    row=latest,
+    direction=direction,
+    quality=quality,
+    min_quality=min_quality,
     regime=regime,
-    price=price,
-    opening_high=opening_high,
-    opening_low=opening_low,
-    vwap=vwap,
-    atr_5m=atr_5m,
-    current_time=current_time
+    trades_today=trades_today,
+    max_trades_per_day=max_trades_per_day,
+    max_consecutive_losses=max_consecutive_losses,
+    cooldown_minutes=cooldown_minutes,
+    allow_chop=allow_chop,
+    start_trade_time=start_trade_time,
+    end_trade_time=end_trade_time
 )
 
-risk_dollars, risk_per_contract, contracts, max_premium = risk_box(
-    account_size=account_size,
-    risk_pct=risk_pct,
-    option_price=option_price,
-    stop_loss_pct=stop_loss_pct
+entry, planned_stop, planned_target = calculate_trade_plan(
+    latest,
+    direction,
+    stop_points,
+    target_points
 )
-
-daily_max_loss = account_size * max_daily_loss_pct / 100
-profit_target_price = option_price * (1 + target_pct / 100)
-stop_price = option_price * (1 - stop_loss_pct / 100)
-
-decision, decision_reason, gate_df = gated_trade_decision(
-    signal=signal,
-    score=score,
-    price=price,
-    vwap=vwap,
-    opening_high=opening_high,
-    opening_low=opening_low,
-    breadth=breadth,
-    breadth_count=breadth_count,
-    rvol=rvol,
-    day_type=day_type,
-    contracts=contracts,
-    current_time=current_time,
-    invalidation=invalidation
-)
-
 
 # ============================================================
-# Main App
+# Main Status Display
 # ============================================================
 
-st.title("SPX 0DTE Gated Decision Dashboard")
-st.caption("Uses SPY as a liquid proxy for SPX directional logic. Decision support only. Does not execute trades.")
+st.subheader("Current Signal State")
 
-with st.expander("Decision Flow", expanded=False):
-    st.markdown("""
-    The app now uses a gated decision flow:
+c1, c2, c3, c4, c5 = st.columns(5)
 
-    1. **Environment Gate**: checks time window, day type, and RVOL.
-    2. **Direction Gate**: checks regime score, breadth direction, and VWAP alignment.
-    3. **Structure Gate**: checks opening range breakout/breakdown.
-    4. **Persistence Gate**: checks whether breadth is strong enough or persistent enough.
-    5. **Risk Gate**: checks position size and invalidation.
-    6. **Final Decision**: outputs BUY CALL, BUY PUT, WATCH ONLY, or STAY OUT.
+c1.metric("Proxy", symbol)
+c2.metric("Last Price", f"{latest['Close']:.2f}")
+c3.metric("Regime", regime)
+c4.metric("Direction", direction)
+c5.metric("Quality", quality)
 
-    This is designed to prevent aggressive trade signals when the broader context does not support the move.
-    """)
+c6, c7, c8, c9 = st.columns(4)
 
-top1, top2, top3, top4 = st.columns(4)
-
-top1.metric("SPY Proxy", f"{price:,.2f}")
-top2.metric("VIX", "N/A" if pd.isna(vix) else f"{vix:,.2f}")
-top3.metric("Breadth", f"{breadth:.2f}")
-top4.metric("Last Bar", str(last_timestamp).split(".")[0])
-
-st.caption(f"Breadth Source: {breadth_source}")
-
-if breadth_mode == "Auto ETF Breadth Proxy":
-    st.caption(f"ETF Breadth: {positive} above VWAP / {negative} below VWAP")
+c6.metric("Signal Score", int(latest["signal_score"]))
+c7.metric("CALL Score", int(latest["call_score"]))
+c8.metric("PUT Score", int(latest["put_score"]))
+c9.metric("RVOL", f"{latest['rvol']:.2f}" if pd.notna(latest["rvol"]) else "N/A")
 
 st.divider()
 
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric("Regime", regime)
-c2.metric("Regime Score", score)
-c3.metric("Signal", signal)
-c4.metric("Suggested Contracts", contracts)
-
-u1, u2, u3, u4 = st.columns(4)
-
-u1.metric("Day Type", day_type)
-u2.metric("RVOL", "N/A" if pd.isna(rvol) else f"{rvol:.2f}", rvol_label)
-u3.metric("Gap Type", gap_type)
-u4.metric("Breadth Persistence", f"{breadth_direction} x{breadth_count}")
-
-st.divider()
-
-st.subheader("Final Trade Decision")
-
-if decision == "BUY CALL":
-    st.success(f"### {decision}")
-elif decision == "BUY PUT":
-    st.error(f"### {decision}")
-elif decision == "WATCH ONLY":
-    st.info(f"### {decision}")
+if trade_allowed:
+    st.success("TRADE ALLOWED")
 else:
-    st.warning(f"### {decision}")
+    st.error("NO TRADE / TRADE BLOCKED")
 
-st.write(f"**Reason:** {decision_reason}")
+st.write("**Gate Status:**")
+for reason in gate_reasons:
+    st.write(f"- {reason}")
 
-d1, d2, d3, d4 = st.columns(4)
+st.write("**Signal Reasons:**")
+for reason in str(latest["signal_reasons"]).split(";"):
+    st.write(f"- {reason.strip()}")
 
-d1.metric("Contracts", contracts)
-d2.metric("Entry Ref.", f"${option_price:,.2f}")
-d3.metric("Stop", f"${stop_price:,.2f}")
-d4.metric("Target", f"${profit_target_price:,.2f}")
+# ============================================================
+# Trade Plan
+# ============================================================
 
-st.caption("This command is a rules-based decision aid only. It does not execute trades.")
+st.subheader("Trade Plan")
 
-st.divider()
+p1, p2, p3, p4 = st.columns(4)
 
-st.subheader("Gated Decision Flow")
-st.dataframe(gate_df, use_container_width=True)
+p1.metric("Entry Reference", f"{entry:.2f}" if pd.notna(entry) else "N/A")
+p2.metric("Planned Stop", f"{planned_stop:.2f}" if pd.notna(planned_stop) else "N/A")
+p3.metric("Planned Target", f"{planned_target:.2f}" if pd.notna(planned_target) else "N/A")
 
-st.divider()
+rr = target_points / stop_points if stop_points > 0 else np.nan
+p4.metric("Reward/Risk", f"{rr:.2f}R")
 
-left, right = st.columns([1.2, 1])
+# ============================================================
+# Manual Trade Logging
+# ============================================================
 
-with left:
-    st.subheader("Market Context")
+st.subheader("Manual Trade Logging")
 
-    st.write(f"**Setup:** {setup}")
+st.caption(
+    "Use this to record when you actually take a trade. "
+    "Later, enter the outcome in R manually or edit the CSV."
+)
 
-    if isinstance(invalidation, (int, float, np.floating)):
-        st.write(f"**Invalidation level:** {invalidation:,.2f}")
-    else:
-        st.write(f"**Invalidation:** {invalidation}")
-
-    st.write("**Regime reasons:**")
-    for r in reasons:
-        st.write(f"- {r}")
-
-    st.write("**Day-type reasons:**")
-    for r in day_type_reasons:
-        st.write(f"- {r}")
-
-with right:
-    st.subheader("Risk Box")
-    st.write(f"**Account size:** ${account_size:,.2f}")
-    st.write(f"**Risk per trade:** ${risk_dollars:,.2f}")
-    st.write(f"**Risk per contract:** ${risk_per_contract:,.2f}")
-    st.write(f"**Max option premium deployed:** ${max_premium:,.2f}")
-    st.write(f"**Daily max loss:** ${daily_max_loss:,.2f}")
-    st.write(f"**Option stop price:** ${stop_price:,.2f}")
-    st.write(f"**Option target price:** ${profit_target_price:,.2f}")
-
-st.divider()
-
-st.subheader("Live Levels and Filters")
-
-levels = pd.DataFrame([
-    {"Level": "Previous Day High", "Value": prev_high},
-    {"Level": "Previous Day Low", "Value": prev_low},
-    {"Level": "Previous Day Close", "Value": prev_close},
-    {"Level": "Open Price", "Value": open_price},
-    {"Level": "Gap %", "Value": gap_pct},
-    {"Level": "Opening Range High", "Value": opening_high},
-    {"Level": "Opening Range Low", "Value": opening_low},
-    {"Level": "VWAP", "Value": vwap},
-    {"Level": "9 EMA", "Value": ema9},
-    {"Level": "20 EMA", "Value": ema20},
-    {"Level": "20 EMA Slope", "Value": ema_slope},
-    {"Level": "5-Min ATR", "Value": atr_5m},
-    {"Level": "RVOL", "Value": rvol},
-    {"Level": "Breadth Score", "Value": breadth},
-    {"Level": "Breadth Persistence Count", "Value": breadth_count},
-])
-
-st.dataframe(levels, use_container_width=True)
-
-if breadth_mode == "Auto ETF Breadth Proxy" and not breadth_df.empty:
-    st.subheader("ETF Breadth Components")
-    st.dataframe(breadth_df, use_container_width=True)
-
-if not breadth_history_df.empty:
-    with st.expander("Breadth Persistence History", expanded=False):
-        st.dataframe(breadth_history_df, use_container_width=True)
-
-if not manual_market_override and not price_df.empty:
-    st.subheader("Intraday SPY Chart")
-
-    chart_df = price_df.set_index("datetime")[["Close"]].copy()
-    chart_df["VWAP"] = vwap
-    chart_df["Opening High"] = opening_high
-    chart_df["Opening Low"] = opening_low
-
-    st.line_chart(chart_df, use_container_width=True)
-
-st.divider()
-
-st.subheader("Trade Journal Entry")
-
-with st.form("journal_form"):
-    j1, j2, j3 = st.columns(3)
-
-    with j1:
-        trade_type = st.selectbox("Trade Type", ["CALL", "PUT", "No Trade", "Watch Only"])
-        entry_price = st.number_input("Entry Option Price", min_value=0.0, value=option_price, step=0.05)
-        exit_price = st.number_input("Exit Option Price", min_value=0.0, value=0.0, step=0.05)
-
-    with j2:
-        contracts_taken = st.number_input("Contracts Taken", min_value=0, value=max(contracts, 0), step=1)
-        entry_underlying = st.number_input("Entry Underlying Price", value=price, step=0.1)
-        exit_underlying = st.number_input("Exit Underlying Price", value=price, step=0.1)
-
-    with j3:
-        notes = st.text_area("Notes", placeholder="What did you see? Did you follow the plan?")
-        followed_plan = st.checkbox("Followed plan?", value=True)
-
-    submitted = st.form_submit_button("Generate Journal Row")
-
-if submitted:
-    pnl = (exit_price - entry_price) * contracts_taken * 100
-
-    journal_row = pd.DataFrame([{
-        "timestamp": datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S"),
-        "trade_type": trade_type,
-        "regime": regime,
-        "regime_score": score,
-        "signal": signal,
-        "decision": decision,
-        "decision_reason": decision_reason,
-        "day_type": day_type,
-        "rvol": rvol,
-        "gap_type": gap_type,
-        "gap_pct": gap_pct,
-        "breadth": breadth,
-        "breadth_source": breadth_source,
-        "breadth_persistence": breadth_count,
-        "entry_underlying": entry_underlying,
-        "exit_underlying": exit_underlying,
-        "entry_option": entry_price,
-        "exit_option": exit_price,
-        "contracts": contracts_taken,
-        "pnl": pnl,
-        "followed_plan": followed_plan,
-        "notes": notes
-    }])
-
-    st.dataframe(journal_row, use_container_width=True)
-
-    csv = journal_row.to_csv(index=False).encode("utf-8")
-
-    st.download_button(
-        "Download Journal Row as CSV",
-        data=csv,
-        file_name="spx_0dte_gated_journal_row.csv",
-        mime="text/csv"
+with st.form("trade_log_form"):
+    actual_trade = st.checkbox("I took this trade")
+    manual_outcome_r = st.number_input(
+        "Outcome R, optional. Example: +1, -1, +0.5",
+        value=0.0,
+        step=0.25
     )
+    include_outcome_now = st.checkbox("Include outcome now", value=False)
+
+    submitted = st.form_submit_button("Save Trade Record")
+
+    if submitted:
+        if actual_trade:
+            record = {
+                "timestamp": latest["datetime"],
+                "date": latest["date"],
+                "direction": direction,
+                "signal_quality": quality,
+                "regime": regime,
+                "entry_price": entry,
+                "planned_stop": planned_stop,
+                "planned_target": planned_target,
+                "status": "TAKEN",
+                "outcome_r": manual_outcome_r if include_outcome_now else np.nan
+            }
+
+            save_trade_record(record)
+            st.success("Trade record saved.")
+
+        else:
+            st.info("No trade record saved because 'I took this trade' was not checked.")
 
 # ============================================================
-# PLACE THIS AFTER decision, decision_reason, gate_df ARE CREATED
+# Event Logging
 # ============================================================
 
-if "previous_state" not in st.session_state:
-    st.session_state.previous_state = {
-        "decision": None,
-        "signal": None,
-        "regime": None,
-        "day_type": None
-    }
-
-current_state = {
-    "decision": decision,
-    "signal": signal,
+event_record = {
+    "timestamp": latest["datetime"],
+    "date": latest["date"],
+    "symbol": symbol,
+    "price": latest["Close"],
     "regime": regime,
-    "day_type": day_type,
-    "gate_status": tuple(gate_df["Status"].tolist())
+    "direction": direction,
+    "signal_quality": quality,
+    "signal_score": latest["signal_score"],
+    "call_score": latest["call_score"],
+    "put_score": latest["put_score"],
+    "rvol": latest["rvol"],
+    "trade_allowed": trade_allowed,
+    "gate_reasons": format_reasons(gate_reasons),
+    "signal_reasons": latest["signal_reasons"],
+    "entry_reference": entry,
+    "planned_stop": planned_stop,
+    "planned_target": planned_target
 }
 
-previous_state = st.session_state.previous_state
-
-state_changed = current_state != previous_state
-
-if state_changed:
-    log_event(
-        timestamp=now_et,
-        price=price,
-        regime=regime,
-        score=score,
-        day_type=day_type,
-        breadth=breadth,
-        breadth_count=breadth_count,
-        rvol=rvol,
-        signal=signal,
-        decision=decision,
-        decision_reason=decision_reason,
-        gate_df=gate_df
-    )
-
-    st.session_state.previous_state = current_state
-
-
+if st.button("Log Current Signal Snapshot"):
+    log_event(event_record)
+    st.success("Signal snapshot logged.")
 
 # ============================================================
-# PLACE THIS NEAR THE BOTTOM OF THE APP
+# Chart
+# ============================================================
+
+st.subheader("Intraday Price Chart")
+
+today_df = df[df["date"] == today].copy()
+
+fig = go.Figure()
+
+fig.add_trace(go.Candlestick(
+    x=today_df["datetime"],
+    open=today_df["Open"],
+    high=today_df["High"],
+    low=today_df["Low"],
+    close=today_df["Close"],
+    name="Price"
+))
+
+fig.add_trace(go.Scatter(
+    x=today_df["datetime"],
+    y=today_df["vwap"],
+    mode="lines",
+    name="VWAP"
+))
+
+fig.add_trace(go.Scatter(
+    x=today_df["datetime"],
+    y=today_df["ema_9"],
+    mode="lines",
+    name="EMA 9"
+))
+
+fig.add_trace(go.Scatter(
+    x=today_df["datetime"],
+    y=today_df["ema_21"],
+    mode="lines",
+    name="EMA 21"
+))
+
+fig.add_trace(go.Scatter(
+    x=today_df["datetime"],
+    y=today_df["or_high"],
+    mode="lines",
+    name="OR High"
+))
+
+fig.add_trace(go.Scatter(
+    x=today_df["datetime"],
+    y=today_df["or_low"],
+    mode="lines",
+    name="OR Low"
+))
+
+# ============================================================
+# Signal Marker Overlay
+# ============================================================
+
+signal_plot_df = today_df.copy()
+
+# Accepted directional signals based on current minimum quality
+signal_plot_df["quality_pass"] = signal_plot_df["signal_quality"].apply(
+    lambda q: quality_passes(q, min_quality)
+)
+
+call_signals = signal_plot_df[
+    (signal_plot_df["signal_direction"] == "CALL") &
+    (signal_plot_df["quality_pass"])
+]
+
+put_signals = signal_plot_df[
+    (signal_plot_df["signal_direction"] == "PUT") &
+    (signal_plot_df["quality_pass"])
+]
+
+rejected_signals = signal_plot_df[
+    (signal_plot_df["signal_direction"].isin(["CALL", "PUT"])) &
+    (~signal_plot_df["quality_pass"])
+]
+
+# CALL markers
+fig.add_trace(go.Scatter(
+    x=call_signals["datetime"],
+    y=call_signals["Low"] * 0.999,
+    mode="markers",
+    name="CALL Signal",
+    marker=dict(
+        symbol="triangle-up",
+        size=14
+    ),
+    text=[
+        f"CALL<br>Quality: {q}<br>Score: {s}<br>Regime: {r}"
+        for q, s, r in zip(
+            call_signals["signal_quality"],
+            call_signals["signal_score"],
+            call_signals["regime"]
+        )
+    ],
+    hoverinfo="text"
+))
+
+# PUT markers
+fig.add_trace(go.Scatter(
+    x=put_signals["datetime"],
+    y=put_signals["High"] * 1.001,
+    mode="markers",
+    name="PUT Signal",
+    marker=dict(
+        symbol="triangle-down",
+        size=14
+    ),
+    text=[
+        f"PUT<br>Quality: {q}<br>Score: {s}<br>Regime: {r}"
+        for q, s, r in zip(
+            put_signals["signal_quality"],
+            put_signals["signal_score"],
+            put_signals["regime"]
+        )
+    ],
+    hoverinfo="text"
+))
+
+# Rejected signal markers
+fig.add_trace(go.Scatter(
+    x=rejected_signals["datetime"],
+    y=rejected_signals["Close"],
+    mode="markers",
+    name="Rejected Signal",
+    marker=dict(
+        symbol="x",
+        size=10
+    ),
+    text=[
+        f"Rejected {d}<br>Quality: {q}<br>Score: {s}<br>Regime: {r}"
+        for d, q, s, r in zip(
+            rejected_signals["signal_direction"],
+            rejected_signals["signal_quality"],
+            rejected_signals["signal_score"],
+            rejected_signals["regime"]
+        )
+    ],
+    hoverinfo="text"
+))
+
+
+fig.update_layout(
+    height=650,
+    xaxis_rangeslider_visible=False,
+    template="plotly_dark",
+    margin=dict(l=20, r=20, t=40, b=20),
+    xaxis=dict(
+    range=[
+        pd.Timestamp.combine(today, time(9, 30)),
+        pd.Timestamp.combine(today, time(16, 0))
+    ]
+    ),
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================
+# Signal Table
+# ============================================================
+
+st.subheader("Recent Signal History")
+
+cols = [
+    "datetime",
+    "Close",
+    "vwap",
+    "ema_9",
+    "ema_21",
+    "or_high",
+    "or_low",
+    "rvol",
+    "regime",
+    "signal_direction",
+    "signal_quality",
+    "signal_score",
+    "call_score",
+    "put_score",
+    "signal_reasons"
+]
+
+st.dataframe(
+    today_df[cols],
+    use_container_width=True
+)
+
+# ============================================================
+# Trade Records
+# ============================================================
+
+st.subheader("Today’s Trade Records")
+
+if trades_today.empty:
+    st.info("No trades recorded today.")
+else:
+    st.dataframe(trades_today, use_container_width=True)
+
+# ============================================================
+# Download Buttons
+# ============================================================
+
+st.subheader("Downloads")
+
+if LOG_FILE.exists():
+    with open(LOG_FILE, "rb") as f:
+        st.download_button(
+            "Download Signal Log CSV",
+            data=f,
+            file_name="0dte_live_v2_log.csv",
+            mime="text/csv"
+        )
+
+if TRADE_FILE.exists():
+    with open(TRADE_FILE, "rb") as f:
+        st.download_button(
+            "Download Trade Log CSV",
+            data=f,
+            file_name="0dte_live_v2_trades.csv",
+            mime="text/csv"
+        )
+
+# ============================================================
+# Footer
 # ============================================================
 
 st.divider()
 
-st.subheader("Automatic Event Log")
-
-if os.path.exists(LOG_FILE):
-
-    log_df = pd.read_csv(LOG_FILE)
-
-    st.dataframe(
-        log_df.tail(50),
-        use_container_width=True
-    )
-
-    csv = log_df.to_csv(index=False).encode("utf-8")
-
-    st.download_button(
-        "Download Full Event Log",
-        data=csv,
-        file_name="spx_event_log.csv",
-        mime="text/csv"
-    )
-
-else:
-    st.info("No events logged yet.")
+st.caption(
+    "V2 architecture: regime classification, signal quality grading, execution gates, cooldown logic, "
+    "manual trade logging, and structured signal snapshots."
+)
