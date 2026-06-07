@@ -443,7 +443,7 @@ with st.sidebar:
 
     start_trade_time = st.time_input(
         "Start Trading",
-        value=time(13, 30)
+        value=time(09, 30)
     )
 
     end_trade_time = st.time_input(
