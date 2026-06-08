@@ -41,7 +41,7 @@ with refresh_col1:
         st.rerun()
 
 with refresh_col2:
-    st.metric(
+    st.(
         "Last Refresh",
         datetime.now().strftime("%H:%M:%S")
     )
@@ -689,6 +689,17 @@ c7.metric("CALL Score", int(latest["call_score"]))
 c8.metric("PUT Score", int(latest["put_score"]))
 c9.metric("RVOL", f"{latest['rvol']:.2f}" if pd.notna(latest["rvol"]) else "N/A")
 
+b1, b2, b3 = st.columns(3)
+
+b1.metric("Breadth State", breadth_state)
+b2.metric("Bullish Breadth", breadth_bullish)
+b3.metric("Bearish Breadth", breadth_bearish)
+
+st.write("**Breadth Details:**")
+
+for item in breadth_details:
+    st.write(f"- {item}")
+
 st.divider()
 
 if trade_allowed:
@@ -704,16 +715,6 @@ st.write("**Signal Reasons:**")
 for reason in str(latest["signal_reasons"]).split(";"):
     st.write(f"- {reason.strip()}")
 
-b1, b2, b3 = st.columns(3)
-
-b1.metric("Breadth State", breadth_state)
-b2.metric("Bullish Breadth", breadth_bullish)
-b3.metric("Bearish Breadth", breadth_bearish)
-
-st.write("**Breadth Details:**")
-
-for item in breadth_details:
-    st.write(f"- {item}")
 # ============================================================
 # Trade Plan
 # ============================================================
