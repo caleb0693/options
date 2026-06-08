@@ -113,6 +113,61 @@ def load_live_data(symbol="SPY", period="5d", interval="5m"):
 
     return df
 
+def load_breadth_data(period="5d", interval="5m"):
+
+    breadth_symbols = {
+        "QQQ": "QQQ",
+        "XLK": "XLK",
+        "SMH": "SMH"
+    }
+
+    breadth_data = {}
+
+    for name, symbol in breadth_symbols.items():
+
+        df = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            auto_adjust=True,
+            progress=False
+        )
+
+        df = flatten_columns(df)
+
+        if df.empty:
+            continue
+
+        df = df.reset_index()
+
+        datetime_col = "Datetime" if "Datetime" in df.columns else "Date"
+        df = df.rename(columns={datetime_col: "datetime"})
+
+        df["datetime"] = pd.to_datetime(df["datetime"])
+
+        if df["datetime"].dt.tz is None:
+            df["datetime"] = df["datetime"].dt.tz_localize("UTC").dt.tz_convert("America/New_York")
+        else:
+            df["datetime"] = df["datetime"].dt.tz_convert("America/New_York")
+
+        df["datetime"] = df["datetime"].dt.tz_localize(None)
+
+        df["date"] = df["datetime"].dt.date
+        df["time"] = df["datetime"].dt.time
+
+        df = df[
+            (df["time"] >= time(9, 30)) &
+            (df["time"] <= time(16, 0))
+        ].copy()
+
+        df = calculate_vwap(df)
+
+        breadth_data[name] = df
+
+    return breadth_data
+
+
+
 def calculate_vwap(df):
     df = df.copy()
 
@@ -274,6 +329,39 @@ def score_signal(row):
 
     return direction, score, quality, reasons, call_score, put_score
 
+
+def calculate_breadth_alignment(row, breadth_snapshot):
+
+    bullish_count = 0
+    bearish_count = 0
+
+    details = []
+
+    for name, snapshot in breadth_snapshot.items():
+
+        if snapshot.empty:
+            continue
+
+        latest = snapshot.iloc[-1]
+
+        if latest["Close"] > latest["vwap"]:
+            bullish_count += 1
+            details.append(f"{name} bullish")
+
+        elif latest["Close"] < latest["vwap"]:
+            bearish_count += 1
+            details.append(f"{name} bearish")
+
+    if bullish_count >= 2:
+        breadth_state = "BULLISH"
+
+    elif bearish_count >= 2:
+        breadth_state = "BEARISH"
+
+    else:
+        breadth_state = "MIXED"
+
+    return breadth_state, bullish_count, bearish_count, details
 
 def quality_passes(quality, min_quality):
     rank = {"D": 0, "C": 1, "B": 2, "A": 3, "A+": 4}
@@ -494,7 +582,10 @@ with st.sidebar:
 # ============================================================
 
 df = load_live_data(symbol=symbol, period=period, interval=interval)
-
+breadth_data = load_breadth_data(
+    period=period,
+    interval=interval
+)
 if df.empty:
     st.error("No market data loaded.")
     st.stop()
@@ -513,6 +604,11 @@ df["put_score"] = [x[5] for x in signal_results]
 
 latest = df.iloc[-1]
 
+breadth_state, breadth_bullish, breadth_bearish, breadth_details = calculate_breadth_alignment(
+    latest,
+    breadth_data
+)
+
 today = latest["date"]
 
 trades = load_trade_state()
@@ -525,6 +621,30 @@ else:
 direction = latest["signal_direction"]
 quality = latest["signal_quality"]
 regime = latest["regime"]
+
+# Breadth alignment adjustment
+
+if direction == "CALL" and breadth_state == "BULLISH":
+
+    if quality == "B":
+        quality = "A"
+
+    elif quality == "A":
+        quality = "A+"
+
+elif direction == "PUT" and breadth_state == "BEARISH":
+
+    if quality == "B":
+        quality = "A"
+
+    elif quality == "A":
+        quality = "A+"
+
+elif direction == "CALL" and breadth_state == "BEARISH":
+    quality = "C"
+
+elif direction == "PUT" and breadth_state == "BULLISH":
+    quality = "C"
 
 trade_allowed, gate_reasons = evaluate_execution_gate(
     row=latest,
@@ -584,6 +704,16 @@ st.write("**Signal Reasons:**")
 for reason in str(latest["signal_reasons"]).split(";"):
     st.write(f"- {reason.strip()}")
 
+b1, b2, b3 = st.columns(3)
+
+b1.metric("Breadth State", breadth_state)
+b2.metric("Bullish Breadth", breadth_bullish)
+b3.metric("Bearish Breadth", breadth_bearish)
+
+st.write("**Breadth Details:**")
+
+for item in breadth_details:
+    st.write(f"- {item}")
 # ============================================================
 # Trade Plan
 # ============================================================
