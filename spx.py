@@ -41,7 +41,7 @@ with refresh_col1:
         st.rerun()
 
 with refresh_col2:
-    st.(
+    st.metric(
         "Last Refresh",
         datetime.now().strftime("%H:%M:%S")
     )
