@@ -10,6 +10,7 @@ import yfinance as yf
 from datetime import datetime, time
 import plotly.graph_objects as go
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # ============================================================
 # Streamlit Config
@@ -39,7 +40,7 @@ with refresh_col1:
         st.rerun()
 
 with refresh_col2:
-    st.metric("Last Refresh", datetime.now().strftime("%H:%M:%S"))
+    st.metric("Last Refresh", datetime.now(ZoneInfo("America/New_York")).strftime("%I:%M:%S %p ET"))
 
 with refresh_col3:
     st.caption("Manual refresh enabled. Click refresh to reload market data and recalculate signals.")
