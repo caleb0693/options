@@ -4,4 +4,3 @@ numpy
 yfinance
 streamlit-autorefresh
 plotly
-zoneinfo
