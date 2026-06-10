@@ -929,7 +929,7 @@ with st.sidebar:
 
     st.header("Trading Window")
 
-    start_trade_time = st.time_input("Start Trading", value=time(13, 30))
+    start_trade_time = st.time_input("Start Trading", value=time(10, 00))
     end_trade_time = st.time_input("End Trading", value=time(15, 45))
 
     st.header("Risk Controls")
