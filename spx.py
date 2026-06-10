@@ -1,6 +1,6 @@
 # ============================================================
-# Live 0DTE SPX App V2.1
-# Signal Quality + Regime + Execution Gate + 14 ETF Breadth
+# Live 0DTE SPX App V2.2
+# Signal Quality + Regime + Execution Gate + 14 ETF Breadth + Reversal Risk
 # ============================================================
 
 import streamlit as st
@@ -8,21 +8,21 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime, time
+from zoneinfo import ZoneInfo
 import plotly.graph_objects as go
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 # ============================================================
 # Streamlit Config
 # ============================================================
 
 st.set_page_config(
-    page_title="Live 0DTE SPX App V2.1",
+    page_title="Live 0DTE SPX App V2.2",
     layout="wide"
 )
 
-st.title("Live 0DTE SPX App V2.1")
-st.caption("Signal-quality, regime-aware, breadth-confirmed, gated decision-support tool for 0DTE SPX-style trading.")
+st.title("Live 0DTE SPX App V2.2")
+st.caption("Signal-quality, regime-aware, breadth-confirmed, reversal-aware, gated decision-support tool for 0DTE SPX-style trading.")
 
 st.warning(
     "This app uses SPY or QQQ intraday market data as a live proxy. "
@@ -43,14 +43,13 @@ with refresh_col2:
     st.metric("Last Refresh", datetime.now(ZoneInfo("America/New_York")).strftime("%I:%M:%S %p ET"))
 
 with refresh_col3:
-    st.caption("Manual refresh enabled. Click refresh to reload market data and recalculate signals.")
+    st.caption("Manual refresh enabled. Click refresh to reload market data and recalculate signals. Time shown in US/Eastern.")
 
 # ============================================================
 # File Paths
 # ============================================================
 
-LOG_FILE = Path("0dte_live_v2_1_log.csv")
-TRADE_FILE = Path("0dte_live_v2_1_trades.csv")
+LOG_FILE = Path("0dte_live_v2_2_log.csv")
 
 # ============================================================
 # Constants
@@ -548,48 +547,18 @@ def suggest_contracts(trade_allowed, quality, regime_score, rvol, max_contracts)
     return int(max(0, base))
 
 
-def load_trade_state():
-    if TRADE_FILE.exists():
-        return pd.read_csv(TRADE_FILE)
-
-    return pd.DataFrame(columns=[
-        "timestamp", "date", "direction", "signal_quality", "original_quality",
-        "regime", "regime_score", "breadth_state", "entry_price", "planned_stop",
-        "planned_target", "status", "outcome_r"
-    ])
-
-
-def save_trade_record(record):
-    trades = load_trade_state()
-    trades = pd.concat([trades, pd.DataFrame([record])], ignore_index=True)
-    trades.to_csv(TRADE_FILE, index=False)
-
-
-def log_event(record):
-    if LOG_FILE.exists():
-        log_df = pd.read_csv(LOG_FILE)
-    else:
-        log_df = pd.DataFrame()
-
-    log_df = pd.concat([log_df, pd.DataFrame([record])], ignore_index=True)
-    log_df.to_csv(LOG_FILE, index=False)
-
-
 def evaluate_execution_gate(
     row,
     direction,
     quality,
     min_quality,
     regime,
-    trades_today,
-    max_trades_per_day,
-    max_consecutive_losses,
-    cooldown_minutes,
     allow_chop,
     start_trade_time,
     end_trade_time,
     breadth_state,
-    require_breadth_alignment
+    require_breadth_alignment,
+    reversal_state
 ):
     reasons = []
     now_time = row["time"]
@@ -611,22 +580,11 @@ def evaluate_execution_gate(
         if direction == "PUT" and breadth_state not in ["BEARISH", "STRONGLY BEARISH"]:
             reasons.append("Breadth not aligned bearish for PUT")
 
-    if len(trades_today) >= max_trades_per_day:
-        reasons.append("Max trades per day reached")
-
-    if not trades_today.empty:
-        completed = trades_today.dropna(subset=["outcome_r"]).copy()
-        if not completed.empty:
-            completed["outcome_r"] = pd.to_numeric(completed["outcome_r"], errors="coerce")
-            last_losses = completed.tail(max_consecutive_losses)
-            if len(last_losses) >= max_consecutive_losses and (last_losses["outcome_r"] < 0).all():
-                reasons.append("Consecutive loss lockout active")
-
-        last_trade_time = pd.to_datetime(trades_today["timestamp"]).max()
-        current_time = pd.to_datetime(row["datetime"])
-        minutes_since_last_trade = (current_time - last_trade_time).total_seconds() / 60
-        if minutes_since_last_trade < cooldown_minutes:
-            reasons.append(f"Cooldown active: {minutes_since_last_trade:.0f} min since last trade")
+    # Reversal risk gate: do not allow continuation trades when a contrary reversal is elevated/confirmed.
+    if direction == "PUT" and reversal_state in ["Bullish reversal risk elevated", "Bullish reversal confirmed"]:
+        reasons.append("Bullish reversal risk conflicts with PUT continuation")
+    if direction == "CALL" and reversal_state in ["Bearish reversal risk elevated", "Bearish reversal confirmed"]:
+        reasons.append("Bearish reversal risk conflicts with CALL continuation")
 
     trade_allowed = len(reasons) == 0
     if trade_allowed:
@@ -652,6 +610,306 @@ def calculate_trade_plan(row, direction, stop_points, target_points):
 def format_reasons(reasons):
     return "; ".join([str(r) for r in reasons])
 
+
+def wick_ratio(row):
+    body = abs(row["Close"] - row["Open"])
+    body = max(body, 0.0001)
+    upper_wick = row["High"] - max(row["Open"], row["Close"])
+    lower_wick = min(row["Open"], row["Close"]) - row["Low"]
+    return upper_wick / body, lower_wick / body
+
+
+def calculate_reversal_risk(today_df, latest_row, breadth_state, breadth_persistence):
+    """
+    Symmetrical reversal-risk engine.
+
+    This does not try to catch tops or bottoms. It detects when an existing trend is
+    losing control and when the opposite side has started to confirm.
+    """
+    if today_df.empty or len(today_df) < 8:
+        return {
+            "reversal_state": "Insufficient data",
+            "reversal_direction": "NONE",
+            "reversal_score": 0,
+            "trend_continuation_status": "Unknown",
+            "reversal_reasons": ["Not enough intraday bars to evaluate reversal risk"]
+        }
+
+    recent_context = today_df.iloc[:-1].tail(12)
+    if recent_context.empty:
+        recent_context = today_df.tail(12)
+
+    prior_bearish_count = (
+        (recent_context["Close"] < recent_context["vwap"]) &
+        (recent_context["ema_9"] < recent_context["ema_21"])
+    ).sum()
+
+    prior_bullish_count = (
+        (recent_context["Close"] > recent_context["vwap"]) &
+        (recent_context["ema_9"] > recent_context["ema_21"])
+    ).sum()
+
+    prior_trend = "NONE"
+    if prior_bearish_count >= max(3, len(recent_context) // 2):
+        prior_trend = "BEARISH"
+    elif prior_bullish_count >= max(3, len(recent_context) // 2):
+        prior_trend = "BULLISH"
+
+    upper_wick_r, lower_wick_r = wick_ratio(latest_row)
+    recent = today_df.tail(6)
+    previous = today_df.iloc[:-1].tail(6)
+
+    prev_low = previous["Low"].min() if not previous.empty else np.nan
+    prev_high = previous["High"].max() if not previous.empty else np.nan
+
+    bullish_score = 0
+    bearish_score = 0
+    bullish_reasons = []
+    bearish_reasons = []
+
+    # Bearish trend weakening into bullish reversal risk.
+    if prior_trend == "BEARISH":
+        if latest_row["Close"] > latest_row["ema_9"]:
+            bullish_score += 1
+            bullish_reasons.append("Price reclaimed EMA9 after bearish context")
+        if latest_row["Close"] > latest_row["ema_21"]:
+            bullish_score += 1
+            bullish_reasons.append("Price reclaimed EMA21 after bearish context")
+        if latest_row["Close"] > latest_row["vwap"]:
+            bullish_score += 2
+            bullish_reasons.append("Price reclaimed VWAP after bearish control")
+        if pd.notna(prev_low) and latest_row["Low"] <= prev_low and latest_row["Close"] > latest_row["Open"]:
+            bullish_score += 1
+            bullish_reasons.append("Failed new low with bullish close")
+        if lower_wick_r >= 1.5:
+            bullish_score += 1
+            bullish_reasons.append("Long lower wick suggests downside rejection")
+        if breadth_state in ["MIXED", "BULLISH", "STRONGLY BULLISH"]:
+            bullish_score += 1
+            bullish_reasons.append("Breadth no longer strongly supports bearish continuation")
+        if breadth_state in ["BULLISH", "STRONGLY BULLISH"]:
+            bullish_score += 1
+            bullish_reasons.append("Breadth flipped bullish against prior bearish trend")
+        if not str(breadth_persistence).startswith("Bearish"):
+            bullish_score += 1
+            bullish_reasons.append("Bearish breadth persistence weakened")
+        if latest_row.get("bar_return", 0) > 0 and pd.notna(latest_row.get("rvol", np.nan)) and latest_row.get("rvol", 0) >= 1.0:
+            bullish_score += 1
+            bullish_reasons.append("Positive candle with acceptable RVOL")
+
+    # Bullish trend weakening into bearish reversal risk.
+    if prior_trend == "BULLISH":
+        if latest_row["Close"] < latest_row["ema_9"]:
+            bearish_score += 1
+            bearish_reasons.append("Price lost EMA9 after bullish context")
+        if latest_row["Close"] < latest_row["ema_21"]:
+            bearish_score += 1
+            bearish_reasons.append("Price lost EMA21 after bullish context")
+        if latest_row["Close"] < latest_row["vwap"]:
+            bearish_score += 2
+            bearish_reasons.append("Price lost VWAP after bullish control")
+        if pd.notna(prev_high) and latest_row["High"] >= prev_high and latest_row["Close"] < latest_row["Open"]:
+            bearish_score += 1
+            bearish_reasons.append("Failed new high with bearish close")
+        if upper_wick_r >= 1.5:
+            bearish_score += 1
+            bearish_reasons.append("Long upper wick suggests upside rejection")
+        if breadth_state in ["MIXED", "BEARISH", "STRONGLY BEARISH"]:
+            bearish_score += 1
+            bearish_reasons.append("Breadth no longer strongly supports bullish continuation")
+        if breadth_state in ["BEARISH", "STRONGLY BEARISH"]:
+            bearish_score += 1
+            bearish_reasons.append("Breadth flipped bearish against prior bullish trend")
+        if not str(breadth_persistence).startswith("Bullish"):
+            bearish_score += 1
+            bearish_reasons.append("Bullish breadth persistence weakened")
+        if latest_row.get("bar_return", 0) < 0 and pd.notna(latest_row.get("rvol", np.nan)) and latest_row.get("rvol", 0) >= 1.0:
+            bearish_score += 1
+            bearish_reasons.append("Negative candle with acceptable RVOL")
+
+    # Classification.
+    if bullish_score >= 6 and latest_row["Close"] > latest_row["vwap"] and breadth_state in ["BULLISH", "STRONGLY BULLISH"]:
+        state = "Bullish reversal confirmed"
+        direction = "BULLISH"
+        score = bullish_score
+        reasons = bullish_reasons
+    elif bearish_score >= 6 and latest_row["Close"] < latest_row["vwap"] and breadth_state in ["BEARISH", "STRONGLY BEARISH"]:
+        state = "Bearish reversal confirmed"
+        direction = "BEARISH"
+        score = bearish_score
+        reasons = bearish_reasons
+    elif bullish_score >= 3:
+        state = "Bullish reversal risk elevated"
+        direction = "BULLISH"
+        score = bullish_score
+        reasons = bullish_reasons
+    elif bearish_score >= 3:
+        state = "Bearish reversal risk elevated"
+        direction = "BEARISH"
+        score = bearish_score
+        reasons = bearish_reasons
+    elif prior_trend == "BEARISH":
+        state = "Stable bearish trend"
+        direction = "NONE"
+        score = bullish_score
+        reasons = bullish_reasons if bullish_reasons else ["Bearish continuation remains structurally intact"]
+    elif prior_trend == "BULLISH":
+        state = "Stable bullish trend"
+        direction = "NONE"
+        score = bearish_score
+        reasons = bearish_reasons if bearish_reasons else ["Bullish continuation remains structurally intact"]
+    else:
+        state = "No clear reversal structure"
+        direction = "NONE"
+        score = max(bullish_score, bearish_score)
+        reasons = ["No dominant prior trend or reversal structure detected"]
+
+    if "risk elevated" in state:
+        continuation_status = "Caution"
+    elif "confirmed" in state:
+        continuation_status = "Continuation invalidated"
+    elif state.startswith("Stable"):
+        continuation_status = "Continuation favored"
+    else:
+        continuation_status = "Neutral"
+
+    return {
+        "reversal_state": state,
+        "reversal_direction": direction,
+        "reversal_score": int(score),
+        "trend_continuation_status": continuation_status,
+        "reversal_reasons": reasons
+    }
+
+def build_full_day_signal_history(
+    df,
+    today,
+    breadth_data,
+    min_quality,
+    allow_chop,
+    require_breadth_alignment,
+    start_trade_time,
+    end_trade_time,
+    stop_points,
+    target_points,
+    max_contracts,
+    breadth_lookback_bars
+):
+    today_history = df[df["date"] == today].copy()
+
+    records = []
+
+    for i in range(len(today_history)):
+        row = today_history.iloc[i]
+        current_time = row["datetime"]
+
+        partial_day = today_history.iloc[:i + 1].copy()
+
+        b_info = calculate_breadth_alignment(breadth_data, current_time)
+        b_state = b_info["breadth_state"]
+
+        b_persistence, b_persistent_bull, b_persistent_bear = calculate_breadth_persistence(
+            breadth_data,
+            current_time,
+            lookback_bars=int(breadth_lookback_bars)
+        )
+
+        raw_direction = row["signal_direction"]
+        raw_quality = row["raw_signal_quality"]
+
+        adjusted_quality, breadth_note, original_quality = adjust_quality_for_breadth(
+            raw_direction,
+            raw_quality,
+            b_state
+        )
+
+        row_regime_score = calculate_regime_score(row, b_info)
+        row_regime_description = regime_score_label(row_regime_score)
+        row_day_type = classify_day_type(partial_day, row)
+        row_gap_type = classify_gap_type(df, row["date"])
+        row_rvol_label = interpret_rvol(row["rvol"])
+
+        rev_info = calculate_reversal_risk(
+            today_df=partial_day,
+            latest_row=row,
+            breadth_state=b_state,
+            breadth_persistence=b_persistence
+        )
+
+        row_trade_allowed, row_gate_reasons = evaluate_execution_gate(
+            row=row,
+            direction=raw_direction,
+            quality=adjusted_quality,
+            min_quality=min_quality,
+            regime=row["regime"],
+            allow_chop=allow_chop,
+            start_trade_time=start_trade_time,
+            end_trade_time=end_trade_time,
+            breadth_state=b_state,
+            require_breadth_alignment=require_breadth_alignment,
+            reversal_state=rev_info["reversal_state"]
+        )
+
+        row_suggested_contracts = suggest_contracts(
+            row_trade_allowed,
+            adjusted_quality,
+            row_regime_score,
+            row["rvol"],
+            int(max_contracts)
+        )
+
+        row_final_signal = raw_direction if row_trade_allowed else "No Trade"
+
+        entry_ref, planned_stop_ref, planned_target_ref = calculate_trade_plan(
+            row,
+            raw_direction,
+            stop_points,
+            target_points
+        )
+
+        records.append({
+            "datetime": row["datetime"],
+            "Close": row["Close"],
+            "vwap": row["vwap"],
+            "ema_9": row["ema_9"],
+            "ema_21": row["ema_21"],
+            "or_high": row["or_high"],
+            "or_low": row["or_low"],
+            "rvol": row["rvol"],
+            "rvol_label": row_rvol_label,
+            "regime": row["regime"],
+            "regime_description": row_regime_description,
+            "regime_score": row_regime_score,
+            "signal_direction": raw_direction,
+            "final_signal": row_final_signal,
+            "raw_signal_quality": raw_quality,
+            "signal_quality": adjusted_quality,
+            "signal_score": row["signal_score"],
+            "call_score": row["call_score"],
+            "put_score": row["put_score"],
+            "suggested_contracts": row_suggested_contracts,
+            "day_type": row_day_type,
+            "gap_type": row_gap_type,
+            "breadth_state": b_state,
+            "breadth_persistence": b_persistence,
+            "breadth_bullish_count": b_info["bullish_count"],
+            "breadth_bearish_count": b_info["bearish_count"],
+            "net_breadth_score": b_info["net_breadth_score"],
+            "breadth_total_available": b_info["total_available"],
+            "reversal_risk": rev_info["reversal_state"],
+            "reversal_direction": rev_info["reversal_direction"],
+            "reversal_score": rev_info["reversal_score"],
+            "trend_continuation": rev_info["trend_continuation_status"],
+            "gate_reasons": format_reasons(row_gate_reasons),
+            "signal_reasons": row["signal_reasons"],
+            "breadth_quality_note": breadth_note,
+            "entry_reference": entry_ref,
+            "planned_stop": planned_stop_ref,
+            "planned_target": planned_target_ref
+        })
+
+    return pd.DataFrame(records)
+
 # ============================================================
 # Sidebar Settings
 # ============================================================
@@ -671,7 +929,7 @@ with st.sidebar:
 
     st.header("Trading Window")
 
-    start_trade_time = st.time_input("Start Trading", value=time(10, 30))
+    start_trade_time = st.time_input("Start Trading", value=time(13, 30))
     end_trade_time = st.time_input("End Trading", value=time(15, 45))
 
     st.header("Risk Controls")
@@ -679,9 +937,6 @@ with st.sidebar:
     stop_points = st.number_input("Stop Points", min_value=0.05, value=0.50, step=0.05)
     target_points = st.number_input("Target Points", min_value=0.05, value=0.50, step=0.05)
     max_contracts = st.number_input("Max Suggested Contracts", min_value=0, value=3, step=1)
-    max_trades_per_day = st.number_input("Max Trades Per Day", min_value=1, value=3, step=1)
-    max_consecutive_losses = st.number_input("Max Consecutive Losses", min_value=1, value=2, step=1)
-    cooldown_minutes = st.number_input("Cooldown Minutes", min_value=0, value=15, step=5)
 
     st.header("Breadth Settings")
     breadth_lookback_bars = st.number_input("Breadth Persistence Bars", min_value=2, value=3, step=1)
@@ -728,6 +983,7 @@ breadth_persistence, breadth_persistent_bull, breadth_persistent_bear = calculat
     lookback_bars=int(breadth_lookback_bars)
 )
 
+
 # Apply latest breadth-adjusted quality.
 direction = latest["signal_direction"]
 original_quality = latest["raw_signal_quality"]
@@ -750,11 +1006,18 @@ if direction != "NONE":
 
 today_df = df[df["date"] == today].copy()
 
-trades = load_trade_state()
-if not trades.empty and "date" in trades.columns:
-    trades_today = trades[trades["date"].astype(str) == str(today)].copy()
-else:
-    trades_today = pd.DataFrame()
+reversal_info = calculate_reversal_risk(
+    today_df=today_df,
+    latest_row=latest,
+    breadth_state=breadth_state,
+    breadth_persistence=breadth_persistence
+)
+
+reversal_state = reversal_info["reversal_state"]
+reversal_direction = reversal_info["reversal_direction"]
+reversal_score = reversal_info["reversal_score"]
+trend_continuation_status = reversal_info["trend_continuation_status"]
+reversal_reasons = reversal_info["reversal_reasons"]
 
 trade_allowed, gate_reasons = evaluate_execution_gate(
     row=latest,
@@ -762,15 +1025,12 @@ trade_allowed, gate_reasons = evaluate_execution_gate(
     quality=quality,
     min_quality=min_quality,
     regime=regime,
-    trades_today=trades_today,
-    max_trades_per_day=max_trades_per_day,
-    max_consecutive_losses=max_consecutive_losses,
-    cooldown_minutes=cooldown_minutes,
     allow_chop=allow_chop,
     start_trade_time=start_trade_time,
     end_trade_time=end_trade_time,
     breadth_state=breadth_state,
-    require_breadth_alignment=require_breadth_alignment
+    require_breadth_alignment=require_breadth_alignment,
+    reversal_state=reversal_state
 )
 
 entry, planned_stop, planned_target = calculate_trade_plan(latest, direction, stop_points, target_points)
@@ -807,6 +1067,16 @@ b1.metric("Bullish ETFs", breadth_info["bullish_count"])
 b2.metric("Bearish ETFs", breadth_info["bearish_count"])
 b3.metric("Net Breadth", breadth_info["net_breadth_score"])
 b4.metric("ETFs Available", breadth_info["total_available"])
+
+r1, r2, r3, r4 = st.columns(4)
+r1.metric("Reversal Risk", reversal_state)
+r2.metric("Reversal Direction", reversal_direction)
+r3.metric("Reversal Score", reversal_score)
+r4.metric("Trend Continuation", trend_continuation_status)
+
+with st.expander("Reversal Risk Detail", expanded=False):
+    for reason in reversal_reasons:
+        st.write(f"- {reason}")
 
 with st.expander("14 ETF Breadth Detail", expanded=False):
     if breadth_df.empty:
@@ -863,41 +1133,6 @@ p4.metric("Reward/Risk", f"{rr:.2f}R")
 p5.metric("Suggested Contracts", suggested_contracts)
 
 # ============================================================
-# Manual Trade Logging
-# ============================================================
-
-st.subheader("Manual Trade Logging")
-st.caption("Use this to record when you actually take a trade. Later, enter the outcome in R manually or edit the CSV.")
-
-with st.form("trade_log_form"):
-    actual_trade = st.checkbox("I took this trade")
-    manual_outcome_r = st.number_input("Outcome R, optional. Example: +1, -1, +0.5", value=0.0, step=0.25)
-    include_outcome_now = st.checkbox("Include outcome now", value=False)
-    submitted = st.form_submit_button("Save Trade Record")
-
-    if submitted:
-        if actual_trade:
-            record = {
-                "timestamp": latest["datetime"],
-                "date": latest["date"],
-                "direction": direction,
-                "signal_quality": quality,
-                "original_quality": original_quality,
-                "regime": regime,
-                "regime_score": regime_score,
-                "breadth_state": breadth_state,
-                "entry_price": entry,
-                "planned_stop": planned_stop,
-                "planned_target": planned_target,
-                "status": "TAKEN",
-                "outcome_r": manual_outcome_r if include_outcome_now else np.nan
-            }
-            save_trade_record(record)
-            st.success("Trade record saved.")
-        else:
-            st.info("No trade record saved because 'I took this trade' was not checked.")
-
-# ============================================================
 # Event Logging
 # ============================================================
 
@@ -925,6 +1160,11 @@ event_record = {
     "breadth_bearish_count": breadth_info["bearish_count"],
     "net_breadth_score": breadth_info["net_breadth_score"],
     "breadth_persistence": breadth_persistence,
+    "reversal_state": reversal_state,
+    "reversal_direction": reversal_direction,
+    "reversal_score": reversal_score,
+    "trend_continuation_status": trend_continuation_status,
+    "reversal_reasons": format_reasons(reversal_reasons),
     "suggested_contracts": suggested_contracts,
     "trade_allowed": trade_allowed,
     "gate_reasons": format_reasons(gate_reasons),
@@ -1028,6 +1268,27 @@ fig.add_trace(go.Scatter(
     hoverinfo="text"
 ))
 
+
+# Reversal risk marker at the latest candle when continuation risk is elevated/confirmed.
+if reversal_state in [
+    "Bullish reversal risk elevated",
+    "Bullish reversal confirmed",
+    "Bearish reversal risk elevated",
+    "Bearish reversal confirmed"
+]:
+    fig.add_trace(go.Scatter(
+        x=[latest["datetime"]],
+        y=[latest["Close"]],
+        mode="markers",
+        name="Reversal Risk",
+        marker=dict(symbol="diamond", size=16, color="yellow"),
+        text=[
+            f"{reversal_state}<br>Direction: {reversal_direction}<br>Score: {reversal_score}<br>Status: {trend_continuation_status}"
+        ],
+        hoverinfo="text"
+    ))
+
+
 fig.update_layout(
     height=650,
     xaxis_rangeslider_visible=False,
@@ -1043,30 +1304,34 @@ fig.update_layout(
 
 st.plotly_chart(fig, use_container_width=True)
 
-# ============================================================
-# Signal Table
-# ============================================================
 
 st.subheader("Full-Day Signal History")
 
-cols = [
-    "datetime", "Close", "vwap", "ema_9", "ema_21", "or_high", "or_low",
-    "rvol", "rvol_label", "regime", "signal_direction", "raw_signal_quality",
-    "signal_quality", "signal_score", "call_score", "put_score", "signal_reasons"
-]
+history_df = build_full_day_signal_history(
+    df=df,
+    today=today,
+    breadth_data=breadth_data,
+    min_quality=min_quality,
+    allow_chop=allow_chop,
+    require_breadth_alignment=require_breadth_alignment,
+    start_trade_time=start_trade_time,
+    end_trade_time=end_trade_time,
+    stop_points=stop_points,
+    target_points=target_points,
+    max_contracts=max_contracts,
+    breadth_lookback_bars=breadth_lookback_bars
+)
 
-st.dataframe(today_df[cols], use_container_width=True)
+st.dataframe(history_df, use_container_width=True)
 
-# ============================================================
-# Trade Records
-# ============================================================
+csv_history = history_df.to_csv(index=False).encode("utf-8")
 
-st.subheader("Today’s Trade Records")
-
-if trades_today.empty:
-    st.info("No trades recorded today.")
-else:
-    st.dataframe(trades_today, use_container_width=True)
+st.download_button(
+    "Download Full-Day Signal History CSV",
+    data=csv_history,
+    file_name="0dte_v2_2_full_day_signal_history.csv",
+    mime="text/csv"
+)
 
 # ============================================================
 # Downloads
@@ -1076,11 +1341,8 @@ st.subheader("Downloads")
 
 if LOG_FILE.exists():
     with open(LOG_FILE, "rb") as f:
-        st.download_button("Download Signal Log CSV", data=f, file_name="0dte_live_v2_1_log.csv", mime="text/csv")
+        st.download_button("Download Signal Log CSV", data=f, file_name="0dte_live_v2_2_log.csv", mime="text/csv")
 
-if TRADE_FILE.exists():
-    with open(TRADE_FILE, "rb") as f:
-        st.download_button("Download Trade Log CSV", data=f, file_name="0dte_live_v2_1_trades.csv", mime="text/csv")
 
 # ============================================================
 # Footer
@@ -1088,6 +1350,6 @@ if TRADE_FILE.exists():
 
 st.divider()
 st.caption(
-    "V2.1 architecture: regime score, day type, gap type, RVOL interpretation, 14 ETF breadth alignment, "
-    "breadth persistence, signal quality grading, execution gates, manual trade logging, and candle chart signal overlays."
+    "V2.2 architecture: regime score, day type, gap type, RVOL interpretation, 14 ETF breadth alignment, "
+    "breadth persistence, signal quality grading, reversal-risk monitoring, execution gates, event logging, and candle chart signal overlays."
 )
